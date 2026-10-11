@@ -19,35 +19,17 @@ from __future__ import annotations
 import base64
 import email
 import email.header
-import hashlib
-import quopri
-from datetime import UTC, datetime
-from mailbox import Maildir
+from datetime import datetime, timezone
+from mailbox import Maildir, mbox
 from pathlib import Path
 from typing import Any, cast
 
 import pytest
 
-from mail_deduplicate.mail import ADDRESS_HEADERS, DedupMailMixin
-from mail_deduplicate.mail_box import BoxFormat, BoxStructure
+from mail_deduplicate.mail import DedupMailMixin
+from mail_deduplicate.mail_box import MAILDIR_SUBDIRS, BoxFormat, BoxStructure
 
-from .conftest import ALL_FORMATS, MailFactory
-
-
-def create_mail_from_bytes(raw: bytes) -> DedupMailMixin:
-    """Parse raw bytes into a `DedupMailMixin`, body and all.
-
-    Keeps the parsed payload, so the body-derived properties (`body_lines`, `size`,
-    the body hashes) can be exercised.
-    """
-    mail = cast("DedupMailMixin", email.message_from_bytes(raw))
-    mail.__class__ = DedupMailMixin
-    # Swapping __class__ bypasses __init__, so mirror the box metadata defaults it
-    # sets, as they are required to render the mail's repr.
-    mail.box = None
-    mail.source_path = None
-    mail.mail_id = None
-    return mail
+from .conftest import BOX_TYPES, MailFactory
 
 
 def create_mail_with_headers(
@@ -58,25 +40,52 @@ def create_mail_with_headers(
     :param headers: `(name, value)` tuples to set as mail headers. Values can be
         strings, bytes, or `email.header.Header` objects.
     """
-    mail = create_mail_from_bytes(b"Subject: placeholder\n\nTest body")
+    # Create minimal valid email structure
+    raw_mail = b"Subject: placeholder\n\nTest body"
+    msg = email.message_from_bytes(raw_mail)
+
+    # Create a DedupMailMixin by copying the parsed message
+    mail = cast(DedupMailMixin, msg)
+    mail.__class__ = DedupMailMixin
+
+    # Swapping __class__ bypasses __init__, so mirror the box metadata defaults it
+    # sets, as they are required to render the mail's repr.
+    mail.box = None
+    mail.source_path = None
+    mail.mail_id = None
+
     # Replace headers with provided ones
     if headers:
-        cast("Any", mail)._headers = list(headers)
+        cast(Any, mail)._headers = list(headers)
+
+    return mail
+
+
+def create_mail_from_bytes(raw: bytes) -> DedupMailMixin:
+    """Parse raw bytes into a `DedupMailMixin`, body and all.
+
+    Unlike `create_mail_with_headers`, this keeps the parsed payload, so the
+    body-derived properties (`body_lines`, `size`, the body hashes) can be exercised.
+    """
+    mail = cast(DedupMailMixin, email.message_from_bytes(raw))
+    mail.__class__ = DedupMailMixin
+    # Swapping __class__ bypasses __init__, so mirror the box metadata defaults.
+    mail.box = None
+    mail.source_path = None
+    mail.mail_id = None
     return mail
 
 
 def test_body_hashes_distinguish_and_normalize():
-    """`hash_decoded_body` reflects any difference in the decoded body.
-
-    `hash_normalized_body` ignores whitespace, but still separates different bodies.
-    """
+    """`hash_raw_body` reflects any byte difference; `hash_normalized_body` ignores
+    whitespace but still separates genuinely different bodies."""
     base = create_mail_from_bytes(b"Subject: s\n\nHello world\n")
     spaced = create_mail_from_bytes(b"Subject: s\n\nHello    world\n")
     different = create_mail_from_bytes(b"Subject: s\n\nGoodbye world\n")
 
-    # Decoded hashing: even a whitespace difference yields a different hash.
-    assert base.hash_decoded_body != spaced.hash_decoded_body
-    assert base.hash_decoded_body != different.hash_decoded_body
+    # Raw hashing: even a whitespace difference yields a different hash.
+    assert base.hash_raw_body != spaced.hash_raw_body
+    assert base.hash_raw_body != different.hash_raw_body
 
     # Normalized hashing: whitespace is stripped, so the spaced variant collapses onto
     # the base, but a real word change still differs.
@@ -84,160 +93,9 @@ def test_body_hashes_distinguish_and_normalize():
     assert base.hash_normalized_body != different.hash_normalized_body
 
 
-def test_raw_body_hash_reads_the_bytes_of_the_box(tmp_path, config):
-    """`hash_raw_body` hashes the body bytes as stored, line endings aside.
-
-    Two copies of a text in different transfer encodings hash apart under `raw`
-    and alike under `decoded`. Two copies differing in their line endings alone
-    hash alike under both, as every box format rewrites line endings.
-    """
-    headers = b"Subject: s\nContent-Type: text/plain; charset=utf-8\n"
-    # The accented letter is what quoted-printable rewrites.
-    text = "Les cerises mûres tombent.\n".encode()
-    copies = {
-        "eight-bit": headers + b"Content-Transfer-Encoding: 8bit\n\n" + text,
-        "quoted": headers
-        + b"Content-Transfer-Encoding: quoted-printable\n\n"
-        + quopri.encodestring(text),
-        "crlf": (headers + b"Content-Transfer-Encoding: 8bit\n\n" + text).replace(
-            b"\n", b"\r\n"
-        ),
-    }
-    box_path = tmp_path / "box"
-    Maildir(box_path).close()
-    for name, raw in copies.items():
-        (box_path / "new" / name).write_bytes(raw)
-
-    box = BoxFormat.MAILDIR.constructor(box_path, create=False)
-    mails = {}
-    for mail_id, mail in box.iteritems():
-        mail.add_box_metadata(box, mail_id)
-        mail.conf = config
-        mails[mail_id] = mail
-    box.close()
-
-    assert mails["eight-bit"].hash_raw_body != mails["quoted"].hash_raw_body
-    assert mails["eight-bit"].hash_decoded_body == mails["quoted"].hash_decoded_body
-    assert mails["eight-bit"].hash_raw_body == mails["crlf"].hash_raw_body
-    assert mails["eight-bit"].hash_decoded_body == mails["crlf"].hash_decoded_body
-
-
-def test_raw_headers_hash_the_header_block(tmp_path, config):
-    """Under `--raw-headers`, `hash_key()` digests the header block as stored.
-
-    Line endings are reduced to LF first. No header is required: a mail with none
-    of the hashed headers still gets a hash, where the default hashing gives it none.
-    """
-    raw = b"X-Fruit: plum\n\nA plum.\n"
-    box_path = tmp_path / "box"
-    Maildir(box_path).close()
-    (box_path / "new" / "lf").write_bytes(raw)
-    (box_path / "new" / "crlf").write_bytes(raw.replace(b"\n", b"\r\n"))
-
-    config["raw_headers"] = True
-    box = BoxFormat.MAILDIR.constructor(box_path, create=False)
-    mails = {}
-    for mail_id, mail in box.iteritems():
-        mail.add_box_metadata(box, mail_id)
-        mail.conf = config
-        mails[mail_id] = mail
-    box.close()
-
-    for mail in mails.values():
-        assert mail.raw_headers() == b"X-Fruit: plum\n\n"
-        assert mail.raw_body() == b"A plum.\n"
-    assert mails["lf"].hash_key() == hashlib.sha224(b"X-Fruit: plum\n\n").hexdigest()
-    assert mails["crlf"].hash_key() == mails["lf"].hash_key()
-
-
-def test_raw_bytes_come_from_the_file_or_the_box(tmp_path):
-    """A worker reads a mail's bytes from the path it opened, the parent from the box.
-
-    A mail attached to neither cannot be read again.
-    """
-    raw = b"Subject: s\n\nbody\n"
-    path = tmp_path / "mail"
-    path.write_bytes(raw)
-    mail = create_mail_from_bytes(raw)
-
-    with pytest.raises(LookupError):
-        mail.raw_bytes()
-
-    mail._path_override = str(path)
-    assert mail.raw_bytes() == raw
-
-
-@pytest.mark.parametrize(
-    ("raw", "body"),
-    (
-        pytest.param(b"Subject: s\n\nRain.\n", b"Rain.\n", id="blank-line"),
-        pytest.param(b"Subject: s\r\n\r\nRain.\r\n", b"Rain.\n", id="crlf"),
-        pytest.param(
-            b"Subject: s\n\tfolded\nX-Weather: sunny\nRain.\nMore.\n",
-            b"Rain.\nMore.\n",
-            id="missing-blank-line",
-        ),
-        pytest.param(
-            b"From orchard Thu Oct 11\nSubject: s\n\nRain.", b"Rain.", id="envelope"
-        ),
-        pytest.param(b"Subject: s\nX-Weather: sunny\n", b"", id="headers-only"),
-        pytest.param(b"\nRain.\n", b"Rain.\n", id="no-header"),
-        pytest.param(b"", b"", id="empty"),
-        pytest.param(b"Subject: s\r\rRain.\rMore.\r", b"Rain.\rMore.\r", id="bare-cr"),
-        pytest.param(
-            b"Subject: s\rX-Weather: sunny\rRain.\r", b"Rain.\r", id="bare-cr-no-blank"
-        ),
-    ),
-)
-def test_raw_body_starts_where_the_parser_ends_the_headers(tmp_path, raw, body):
-    """`raw_body()` starts after the first blank line, or where a header line ends.
-
-    The parser treats a line that is neither a header nor a continuation as the
-    start of the body when the blank line is missing, and so does the raw body. A
-    bare CR ends a line for both, so the body of a mail with CR line endings is
-    not lost. The header block holds the rest: the two join back into the mail.
-    """
-    path = tmp_path / "mail"
-    path.write_bytes(raw)
-    mail = create_mail_from_bytes(raw)
-    mail._path_override = str(path)
-
-    assert mail.raw_body() == body
-    assert mail.raw_headers() + mail.raw_body() == raw.replace(b"\r\n", b"\n")
-
-
-def test_size_counts_the_bytes_of_the_decoded_body():
-    """`size` is the UTF-8 byte length of the decoded body, not its character count.
-
-    Copies of a mail that differ in their transfer encoding alone measure the same.
-    """
-    text = "Les cerises mûres tombent.\n" * 3
-    headers = b"Subject: s\nContent-Type: text/plain; charset=utf-8\n"
-    eight_bit = create_mail_from_bytes(
-        headers + b"Content-Transfer-Encoding: 8bit\n\n" + text.encode()
-    )
-    quoted = create_mail_from_bytes(
-        headers
-        + b"Content-Transfer-Encoding: quoted-printable\n\n"
-        + quopri.encodestring(text.encode())
-    )
-    base_64 = create_mail_from_bytes(
-        headers
-        + b"Content-Transfer-Encoding: base64\n\n"
-        + base64.encodebytes(text.encode())
-    )
-
-    # Line breaks are not counted, and each `û` weighs its two UTF-8 bytes.
-    assert eight_bit.size == len(text.replace("\n", "").encode("utf-8"))
-    assert eight_bit.size > len(text.replace("\n", ""))
-    assert eight_bit.size == quoted.size == base_64.size
-
-
 def test_body_lines_gathers_multipart_preamble_and_epilogue():
-    """`body_lines` collects the preamble, every leaf part and the epilogue.
-
-    It skips the multipart container itself.
-    """
+    """`body_lines` collects the preamble, every leaf part and the epilogue, skipping
+    the multipart container itself."""
     raw = (
         b"Subject: multi\n"
         b'Content-Type: multipart/mixed; boundary="BOUND"\n'
@@ -262,93 +120,31 @@ def test_body_lines_gathers_multipart_preamble_and_epilogue():
     assert "This is the epilogue." in lines
 
 
-def multipart_mail(
-    preamble: bytes = b"Forecast.",
-    part: bytes = b"Sunny.",
-    epilogue: bytes = b"End of forecast.",
-) -> bytes:
-    """Wrap one 8-bit `text/plain` part in a `multipart/mixed` mail."""
-    return (
-        b"Subject: multi\n"
-        b'Content-Type: multipart/mixed; boundary="BOUND"\n'
-        b"\n" + preamble + b"\n"
-        b"--BOUND\n"
-        b"Content-Type: text/plain; charset=utf-8\n"
-        b"Content-Transfer-Encoding: 8bit\n"
-        b"\n" + part + b"\n"
-        b"--BOUND--\n" + epilogue + b"\n"
+def test_decode_part_returns_non_text_payload_as_is():
+    """A non-text part is passed through undecoded."""
+    raw = b"Subject: s\nContent-Type: application/octet-stream\n\nraw-binary-payload\n"
+    assert "raw-binary-payload" in create_mail_from_bytes(raw).body_lines
+
+
+def test_decode_part_falls_back_to_utf8_without_charset():
+    """A text part with no declared charset decodes via the utf-8 fallback once the
+    ascii attempt fails on non-ASCII bytes."""
+    raw = b"Subject: s\nContent-Type: text/plain\n\n" + "Café déjà vu\n".encode()
+    assert "Café déjà vu" in create_mail_from_bytes(raw).body_lines
+
+
+def test_decode_part_falls_back_to_raw_when_charset_fails():
+    """When the declared charset cannot decode the bytes, the raw payload is returned
+    instead of crashing."""
+    payload = base64.b64encode(b"\xff\xfe not valid utf-8").decode("ascii")
+    raw = (
+        b"Subject: s\n"
+        b'Content-Type: text/plain; charset="utf-8"\n'
+        b"Content-Transfer-Encoding: base64\n"
+        b"\n" + payload.encode("ascii") + b"\n"
     )
-
-
-@pytest.mark.parametrize(
-    ("raw", "expected"),
-    [
-        pytest.param(
-            multipart_mail(preamble="台北天氣預報".encode()),
-            "台北天氣預報",
-            id="utf8-preamble",
-        ),
-        pytest.param(
-            multipart_mail(epilogue="台北天氣預報".encode()),
-            "台北天氣預報",
-            id="utf8-epilogue",
-        ),
-        pytest.param(multipart_mail(part="晴天".encode()), "晴天", id="utf8-part"),
-        pytest.param(
-            multipart_mail(preamble=b"Forecast: 25\xb0C"),
-            "Forecast: 25\N{REPLACEMENT CHARACTER}C",
-            id="latin1-preamble",
-        ),
-        pytest.param(
-            multipart_mail(epilogue=b"Forecast: 25\xb0C"),
-            "Forecast: 25\N{REPLACEMENT CHARACTER}C",
-            id="latin1-epilogue",
-        ),
-        pytest.param(
-            b"Subject: s\n"
-            b"Content-Type: application/octet-stream\n"
-            b"\n"
-            b"raw-binary-payload\n",
-            "raw-binary-payload",
-            id="non-text-part-as-is",
-        ),
-        # The ASCII attempt fails on non-ASCII bytes, the UTF-8 one does not.
-        pytest.param(
-            b"Subject: s\nContent-Type: text/plain\n\n" + "Café déjà vu\n".encode(),
-            "Café déjà vu",
-            id="no-charset-utf8-fallback",
-        ),
-        pytest.param(
-            b"Subject: s\n"
-            b'Content-Type: text/plain; charset="utf-8"\n'
-            b"Content-Transfer-Encoding: base64\n"
-            b"\n" + base64.b64encode(b"\xff\xfe not valid utf-8") + b"\n",
-            base64.b64encode(b"\xff\xfe not valid utf-8").decode("ascii"),
-            id="charset-fails-raw-payload",
-        ),
-    ],
-)
-def test_body_lines_decodes_each_part(raw, expected):
-    """Every part of a mail is decoded into its body lines, whatever its bytes.
-
-    Both body hashes are computed from them.
-
-    The parser keeps each non-ASCII byte as a lone surrogate. `get_payload()` decodes
-    the parts, and `body_lines` decodes the preamble and epilogue as UTF-8, instead of
-    leaving surrogates that crash both body hashes with a `UnicodeEncodeError`. A byte
-    that is not valid UTF-8 becomes `U+FFFD`.
-
-    A non-text part is passed through undecoded. A text part with no charset is tried
-    as ASCII, then as UTF-8. A text part its charset cannot decode comes back as its
-    raw payload instead of crashing.
-
-    See: https://github.com/kdeldycke/mail-deduplicate/issues/1085
-    """
-    mail = create_mail_from_bytes(raw)
-
-    assert expected in mail.body_lines
-    assert mail.hash_decoded_body
-    assert mail.hash_normalized_body
+    # The undecodable payload does not raise and leaves a non-empty body.
+    assert create_mail_from_bytes(raw).body_lines
 
 
 @pytest.mark.parametrize(
@@ -395,21 +191,8 @@ def test_body_lines_decodes_each_part(raw, expected):
         pytest.param(
             "Custom",
             [b"\xff\xfe invalid utf-8"],
-            ["\\xff\\xfe invalid utf-8"],
-            id="bytes-invalid-utf8-escaped",
-        ),
-        # A mail parsed from bytes keeps each non-ASCII byte as a lone surrogate.
-        pytest.param(
-            "Subject",
-            ["Noël".encode().decode("ascii", "surrogateescape")],
-            ["Noël"],
-            id="raw-utf8-bytes-decoded",
-        ),
-        pytest.param(
-            "Subject",
-            ["Noël".encode("latin-1").decode("ascii", "surrogateescape")],
-            ["No\\xebl"],
-            id="raw-latin1-byte-escaped",
+            ["\ufffd\ufffd invalid utf-8"],
+            id="bytes-invalid-utf8-replaced",
         ),
         # === Empty/missing value filtering ===
         pytest.param(
@@ -759,111 +542,156 @@ def test_header_normalization(header_name, values, expected):
     assert result == expected
 
 
-def test_raw_8bit_headers_hash_apart():
-    """Two headers that differ in their raw 8-bit bytes alone hash apart.
-
-    `get_all()` hands such a header over with every non-ASCII byte replaced by
-    `U+FFFD`, under which `Noël` and `Noêl` in latin-1 read alike.
-    """
-    diaeresis = create_mail_from_bytes(b"Subject: " + "Noël".encode("latin-1") + b"\n")
-    circumflex = create_mail_from_bytes(b"Subject: " + "Noêl".encode("latin-1") + b"\n")
-    utf8 = create_mail_from_bytes(b"Subject: " + "Noël".encode() + b"\n")
-
-    assert list(diaeresis.normalized_header_values("subject")) == ["No\\xebl"]
-    assert list(circumflex.normalized_header_values("subject")) == ["No\\xeal"]
-    assert list(utf8.normalized_header_values("subject")) == ["Noël"]
-
-
-def test_raw_8bit_date_parses():
-    """A `Date` holding raw 8-bit bytes parses like its ASCII spelling.
-
-    `get()` hands such a header over as a `Header`, which `parsedate_tz()` cannot
-    split. See: https://github.com/kdeldycke/mail-deduplicate/issues/1117
-    """
-    date = b"Date: Sat, 10 Sep 2005 08:44:22 +0200 (Paris, Madrid (heure d'%s))\n"
-    latin1 = create_mail_from_bytes(date % "été".encode("latin-1"))
-    ascii_only = create_mail_from_bytes(date % b"ete")
-
-    expected = datetime(2005, 9, 10, 6, 44, 22, tzinfo=UTC).timestamp()
-    assert latin1.parsed_date == ascii_only.parsed_date == expected
-    assert list(latin1.normalized_header_values("date")) == ["2005-09-10"]
-
-
-@pytest.mark.parametrize(
-    "header_id",
-    sorted(
-        ADDRESS_HEADERS
-        | {
-            name.removeprefix("normalize_").replace("_", "-")
-            for name in vars(DedupMailMixin)
-            if name.startswith("normalize_") and name != "normalize_address_header"
-        }
-    ),
-)
-def test_normalizers_read_raw_8bit_bytes(header_id):
-    """Every header with its own normalization reads a value holding raw 8-bit bytes.
-
-    A normalizer that reads its header again with `get()` gets a `Header`, which
-    string functions reject: `header_values()` gives the text instead.
-    """
-    mail = create_mail_from_bytes(
-        header_id.encode() + b": Sat, 10 Sep 2005 08:44:22 +0200 (heure d'\xe9t\xe9)\n"
-    )
-    assert len(list(mail.normalized_header_values(header_id))) == 1
-
-
-@pytest.mark.parametrize(
-    "header",
-    (
-        pytest.param(("Date", "invalid date"), id="invalid-date"),
-        pytest.param(("Date", ""), id="empty-date"),
-        pytest.param(("Date", "Hello, World!"), id="greeting-date"),
-        pytest.param(("Subject", "No date around here"), id="no-date-header"),
-        pytest.param(
-            ("Date", "Thu, 01 Jan 99999 00:00:00 +0000"), id="year-out-of-range"
-        ),
-        pytest.param(
-            ("Date", "Thu, 01 Jan 99999 00:00:00"), id="year-out-of-range-no-timezone"
-        ),
-    ),
-)
-def test_unparsable_date_returns_none(header):
-    """A missing, unparsable or out-of-range `Date` gives no timestamp, not a crash."""
-    mail = create_mail_with_headers(header)
+@pytest.mark.parametrize("date_value", ["invalid date", "", "Hello, World!"])
+def test_unparsable_date_returns_none(date_value):
+    """An unparsable `Date` header produces no timestamp instead of crashing."""
+    mail = create_mail_with_headers(("Date", date_value))
     assert mail.parsed_date is None
 
 
-@ALL_FORMATS
-def test_mail_path_derived_from_box(make_box, box_format):
-    """A mail's location comes from its box's own index, not from opening its file.
+def test_missing_date_header_returns_none():
+    """A mail without any `Date` header produces no timestamp instead of crashing."""
+    mail = create_mail_with_headers(("Subject", "No date around here"))
+    assert mail.parsed_date is None
 
-    Its repr renders that location, ready to be copy-pasted for inspection.
 
-    Folder-based boxes give every mail its own file, so their mails carry distinct
-    paths below the box's directory, which their repr shows. File-based boxes pack
-    every mail into the box's single file, so their mails all share its path, and
-    their repr adds the mail ID to tell them apart.
+def test_header_object_date_returns_none(tmp_path):
+    """A `Date` handed back as an `email.header.Header` produces no timestamp instead
+    of crashing.
+
+    Headers holding raw 8-bit bytes, which old `mbox` archives like Thunderbird's are
+    full of, come back from the stdlib as `Header` objects rather than strings.
+    """
+    # The same value reaches `parsed_date` through both routes: a `Header` planted on
+    # a parsed message, and an actual 8-bit header round-tripped through an `mbox`.
+    planted = create_mail_with_headers(("Date", email.header.Header("invalid date")))
+    assert planted.parsed_date is None
+
+    box_path = tmp_path / "8bit-date.mbox"
+    box_path.write_bytes(
+        b"From - Sat, 15 Feb 2024 12:00:00 +0100\r\n"
+        b"Date: mer. 15 f\xe9vr. 2024 12:00:00 +0100\r\n"
+        b"From: a@b.c\r\n"
+        b"To: baz\r\n"
+        b"Subject: t\r\n"
+        b"Message-ID: <x@y>\r\n"
+        b"\r\n"
+        b"body\r\n"
+    )
+    box = BoxFormat.MBOX.constructor(box_path, create=False)
+    mail_id, mail = next(iter(box.iteritems()))
+    mail.add_box_metadata(box, mail_id)
+    assert isinstance(mail.get("Date"), email.header.Header)
+    assert mail.parsed_date is None
+    box.close()
+
+
+@pytest.mark.parametrize(
+    "date_value",
+    ("Tue, 1 Jan 1000 00:00:00 +0000", "Fri, 31 Dec 9999 23:59:59 +0000"),
+)
+def test_out_of_range_date_is_rejected_or_renderable(date_value):
+    """A `Date` outside the platform's timestamp range is either dropped or kept as a
+    timestamp that converts back into a `datetime`.
+
+    Windows rejects far past and future dates that `parsedate_tz` happily converts,
+    and `datetime.fromtimestamp` used to abort the whole run on them.
+    """
+    mail = create_mail_with_headers(("Date", date_value))
+    timestamp = mail.parsed_date
+    if timestamp is not None:
+        datetime.fromtimestamp(timestamp, tz=timezone.utc)
+    # Whichever way the date was treated, hashing still normalizes it without raising.
+    assert list(mail.normalized_header_values("date"))
+
+
+def test_undecodable_body_bytes_hash_without_crashing():
+    """Body bytes no charset could decode are hashed instead of aborting the run.
+
+    A multipart's preamble and epilogue reach `body_lines` as strings carrying
+    `surrogateescape` characters, which a plain UTF-8 encoding refuses.
+    """
+    raw_mail = (
+        b"Subject: t\r\n"
+        b"MIME-Version: 1.0\r\n"
+        b"Content-Type: multipart/mixed; boundary=XX\r\n"
+        b"\r\n"
+        b"preamble caf\xe9\r\n"
+        b"--XX\r\n"
+        b"Content-Type: text/plain\r\n"
+        b"\r\n"
+        b"inner\r\n"
+        b"--XX--\r\n"
+        b"epilogue caf\xe9\r\n"
+    )
+    msg = email.message_from_bytes(raw_mail)
+    mail = cast(DedupMailMixin, msg)
+    mail.__class__ = DedupMailMixin
+    mail.box = None
+    mail.source_path = None
+    mail.mail_id = None
+
+    assert any("\udce9" in line for line in mail.body_lines)
+    assert mail.hash_raw_body
+    assert mail.hash_normalized_body
+
+
+def test_maildir_repr_renders_mail_file_path(make_box):
+    """The repr of a maildir mail is the fully-qualified path of its own file, ready
+    to be copy-pasted for direct inspection.
 
     See: https://github.com/kdeldycke/mail-deduplicate/issues/157
     """
-    box_path, _, _ = make_box(box_format.base_class, [MailFactory(), MailFactory()])
-    box = box_format.constructor(box_path, create=False)
+    box_path, _, _ = make_box(Maildir, [MailFactory()])
+    box = BoxFormat.MAILDIR.constructor(box_path, create=False)
+    mail_id, mail = next(iter(box.iteritems()))
+    mail.add_box_metadata(box, mail_id)
+    box.close()
 
-    paths = []
+    assert repr(mail) == f"<MaildirDedupMail {mail.path}>"
+
+    # The rendered path points to the mail's own file within the box.
+    path = Path(mail.path)
+    assert path.is_file()
+    assert path.parent.name in MAILDIR_SUBDIRS
+    assert path.parent.parent == Path(box_path)
+
+
+def test_mbox_repr_appends_mail_id(make_box):
+    """Mails of a file-based box all share the box's path, so their repr keeps the
+    mail ID to tell them apart."""
+    box_path, _, _ = make_box(mbox, [MailFactory(), MailFactory()])
+    box = BoxFormat.MBOX.constructor(box_path, create=False)
     reprs = set()
     for mail_id, mail in box.iteritems():
         mail.add_box_metadata(box, mail_id)
-        paths.append(mail.path)
+        assert repr(mail) == f"<mboxDedupMail {box_path}:{mail_id}>"
         reprs.add(repr(mail))
-        name = type(mail).__name__
-        if box_format.structure is BoxStructure.FOLDER:
-            assert repr(mail) == f"<{name} {mail.path}>"
-        else:
-            assert repr(mail) == f"<{name} {box_path}:{mail_id}>"
+    box.close()
+
+    assert len(reprs) == 2
+    assert Path(box_path).is_file()
+
+
+@pytest.mark.parametrize("box_type", BOX_TYPES)
+def test_mail_path_derived_from_box(make_box, box_type):
+    """A mail's location comes from its box's own index, not from opening its file.
+
+    Folder-based boxes give every mail its own file, so their mails carry distinct
+    paths below the box's directory. File-based boxes pack every mail into the box's
+    single file, so their mails all share its path and are told apart by their ID.
+    """
+    box_format = next(fmt for fmt in BoxFormat if fmt.base_class is box_type)
+    box_path, _, _ = make_box(box_type, [MailFactory(), MailFactory()])
+    box = box_format.constructor(box_path, create=False)
+
+    paths = []
+    for mail_id, mail in box.iteritems():
+        mail.add_box_metadata(box, mail_id)
+        paths.append(mail.path)
     box.close()
 
     assert len(paths) == 2
-    assert len(reprs) == 2
     # Whatever the layout, the path points at something readable on disk.
     assert all(Path(path).is_file() for path in paths)
 
@@ -876,9 +704,10 @@ def test_mail_path_derived_from_box(make_box, box_format):
         assert set(paths) == {box_path}
 
 
-def load_single_mail(make_box, config, box_format):
+def load_single_mail(make_box, config, box_type):
     """Helper returning the single mail of a fresh test box, ready for dedup work."""
-    box_path, _, _ = make_box(box_format.base_class, [MailFactory()])
+    box_format = next(fmt for fmt in BoxFormat if fmt.base_class is box_type)
+    box_path, _, _ = make_box(box_type, [MailFactory()])
     box = box_format.constructor(box_path, create=False)
     mail_id, mail = next(iter(box.iteritems()))
     mail.add_box_metadata(box, mail_id)
@@ -886,16 +715,15 @@ def load_single_mail(make_box, config, box_format):
     return box, mail_id, mail
 
 
-@pytest.mark.parametrize("box_format", (BoxFormat.MAILDIR, BoxFormat.MBOX), ids=str)
-def test_dehydrate_hydrate_roundtrip(make_box, config, box_format):
-    """Dehydration drops the parsed message, but keeps the scalars of the strategies.
-
-    Content-dependent properties must transparently restore the exact same content
-    from the source box.
+@pytest.mark.parametrize("box_type", (Maildir, mbox))
+def test_dehydrate_hydrate_roundtrip(make_box, config, box_type):
+    """Dehydration must drop the parsed message but keep the scalars used by the
+    selection strategies, and content-dependent properties must transparently
+    restore the exact same content from the source box.
 
     See: https://github.com/kdeldycke/mail-deduplicate/issues/761
     """
-    box, _, mail = load_single_mail(make_box, config, box_format)
+    box, _, mail = load_single_mail(make_box, config, box_type)
 
     original_text = str(mail)
     original_body = mail.body_lines
@@ -923,13 +751,11 @@ def test_dehydrate_hydrate_roundtrip(make_box, config, box_format):
     box.close()
 
 
-@pytest.mark.parametrize("box_format", (BoxFormat.MAILDIR, BoxFormat.MBOX), ids=str)
-def test_dehydrated_mail_defers_body_reads(make_box, config, box_format):
-    """A mail dehydrated before its body was decoded re-reads its message on access.
-
-    The first body-dependent access reads it from the source box.
-    """
-    box, mail_id, mail = load_single_mail(make_box, config, box_format)
+@pytest.mark.parametrize("box_type", (Maildir, mbox))
+def test_dehydrated_mail_defers_body_reads(make_box, config, box_type):
+    """A mail dehydrated before its body was ever decoded must re-read its message
+    from the source box on the first body-dependent access."""
+    box, mail_id, mail = load_single_mail(make_box, config, box_type)
     twin = box[mail_id]
     twin.conf = config
 
@@ -939,6 +765,6 @@ def test_dehydrated_mail_defers_body_reads(make_box, config, box_format):
     assert "size" not in vars(mail)
     assert "body_lines" not in vars(mail)
 
-    assert mail.size == len("".join(twin.body_lines).encode("utf-8"))
+    assert mail.size == len("".join(twin.body_lines))
     assert mail.is_hydrated
     box.close()

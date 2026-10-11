@@ -5,6 +5,7 @@
 > [!WARNING]
 > This version is **not released yet** and is under active development.
 
+- Fix three crashes on real-world mail archives: a `Date` header handed back as an `email.header.Header` instead of a string, a `Date` outside the platform's timestamp range, and body bytes (a multipart's preamble and epilogue among them) that no charset could decode. The first two fall back to an undated mail, the last is hashed through `surrogateescape`.
 - Fix the `--strategy` help, which said no action runs without a strategy, while a copy or a move still carries the mails without duplicates.
 - Fix the tutorial and a warning advising to narrow `--hash-header` for mails too dissimilar from their set.
 
