@@ -350,13 +350,52 @@ def contains_eml(path: Path) -> bool:
     return False
 
 
+def is_mbox_file(path: Path) -> bool:
+    """Returns `True` when the file holds a single `mbox` box.
+
+    Mbox files are extension-less, so their content is sniffed: they all start with
+    a `From ` separator line. Thunderbird also keeps an `.msf` summary next to every
+    folder it holds, empty ones included, which recognizes those. The summaries
+    themselves and the other profile sidecar files are not mails.
+    """
+    if path.name.startswith(".") or path.suffix.lower() == ".msf":
+        return False
+    if path.with_name(f"{path.name}.msf").is_file():
+        return True
+    try:
+        with path.open("rb") as file:
+            return file.read(5) == b"From "
+    except OSError:
+        return False
+
+
+def iter_mbox_files(path: Path) -> Iterator[Path]:
+    """Yields every `mbox` file held by a directory tree, in a stable order.
+
+    Dives into Thunderbird's `.sbd` sub-folder directories, and skips hidden ones.
+    """
+    for dirpath, dirnames, filenames in os.walk(path):
+        dirnames[:] = sorted(d for d in dirnames if not d.startswith("."))
+        for filename in sorted(filenames):
+            file = Path(dirpath) / filename
+            if is_mbox_file(file):
+                yield file
+
+
+def contains_mbox(path: Path) -> bool:
+    """Returns `True` when the path holds at least one `mbox` file, at any depth."""
+    return next(iter_mbox_files(path), None) is not None
+
+
 def autodetect_box_type(path: Path) -> BoxFormat:
     """Auto-detect the format of the mailbox located at the provided path.
 
     If the path is a file, then it is considered as an `mbox`. Else, if the
     provided path is a folder and features the `MAILDIR_SUBDIRS` sub-directories,
     or holds nested maildir folders at any depth, it is parsed as a `maildir`.
-    A folder holding loose `.eml` files instead is parsed as an `eml` source.
+    A folder holding loose `.eml` files instead is parsed as an `eml` source, and a
+    folder holding `mbox` files as an `mbox` source, which is how Thunderbird stores
+    its folders.
 
     ```{todo}
     Future finer autodetection heuristics should be implemented here. Some ideas:
@@ -379,11 +418,13 @@ def autodetect_box_type(path: Path) -> BoxFormat:
             box_format = BoxFormat.MAILDIR
         elif contains_eml(path):
             box_format = BoxFormat.EML
+        elif contains_mbox(path):
+            box_format = BoxFormat.MBOX
         else:
             raise ValueError(
                 f"Unrecognized folder: no {'/'.join(sorted(MAILDIR_SUBDIRS))} "
-                "maildir structure, no nested maildir folders, and no .eml files "
-                "found. Force a format with --input-format."
+                "maildir structure, no nested maildir folders, no .eml files, and "
+                "no mbox files found. Force a format with --input-format."
             )
 
     # A single file is read as an mbox.
@@ -408,12 +449,24 @@ def open_box(
 
     If `box_format` is provided, forces the opening of the box in the specified format.
     Else, defaults to autodetection.
+
+    An `mbox` directory holds one box per mbox file it contains rather than a single
+    box rooted at the directory, which is how Thunderbird stores its folders.
     """
     logging.info(f"\nOpening {get_current_theme().choice(str(path))} ...")
     if not box_format:
         box_format = autodetect_box_type(path)
     else:
         logging.warning(f"Forcing {box_format} format.")
+
+    if box_format is BoxFormat.MBOX and path.is_dir():
+        boxes = []
+        for file in iter_mbox_files(path):
+            logging.info(f"Opening {get_current_theme().choice(str(file))} ...")
+            boxes.append(
+                lock_box(box_format.constructor(file, create=False), force_unlock)
+            )
+        return boxes
 
     # Do not allow the constructor to create a new mailbox if not found.
     box = box_format.constructor(path, create=False)

@@ -394,3 +394,74 @@ def test_eml_folders_unsupported(tmp_path):
     assert box.list_folders() == []
     with pytest.raises(NotImplementedError):
         box.get_folder("sub")
+
+
+def build_thunderbird_tree(root: Path, folders: dict[str, list[MailFactory]]):
+    """Lay out a Thunderbird-style tree of mbox folders.
+
+    `folders` maps the relative path of each mbox file to the mails it holds, so a
+    sub-folder appears as a path inside a `.sbd` directory. Every folder gets the
+    `.msf` summary Thunderbird keeps next to it.
+    """
+    root.mkdir(parents=True)
+    for relative, mails in folders.items():
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        box = mailbox.mbox(path, create=True)
+        for mail in mails:
+            box.add(mail.render())
+        box.flush()
+        box.close()
+        (root / f"{relative}.msf").write_text("mock summary")
+
+
+def test_thunderbird_tree_autodetect_and_dedup(invoke, tmp_path):
+    """A Thunderbird-style directory of mbox folders is autodetected and deduplicated,
+    `.sbd` sub-folders included, while `.msf` summaries and profile sidecar files are
+    left out of the run.
+    """
+    root = tmp_path / "Mail" / "Local Folders"
+    dup = MailFactory(date="2024-02-05", message_id="<dup@example.com>")
+    unique = MailFactory(date="2024-02-06", message_id="<unique@example.com>")
+    build_thunderbird_tree(
+        root,
+        {
+            "Inbox": [dup, unique],
+            # An empty folder is still a box, recognized by its `.msf` summary alone.
+            "Trash": [],
+            "Inbox.sbd/Archive": [dup],
+        },
+    )
+    # Profile files sharing the folder tree are not mails.
+    (root / "prefs.js").write_text("user_pref('mail.server.default.type', 'none');")
+
+    result = invoke("--strategy=select-one", "--action=delete-discarded", str(root))
+
+    assert result.exit_code == 0
+    assert "mbox detected." in result.stderr
+    assert result.stderr.count("2 mails found.") == 1
+    assert result.stderr.count("1 mails found.") == 1
+    assert result.stderr.count("0 mails found.") == 1
+
+    # One copy of the duplicated mail was deleted, its survivor and the unique mail
+    # remain, and the sidecar files were left untouched.
+    total = 0
+    for folder in ("Inbox", "Inbox.sbd/Archive"):
+        box = mailbox.mbox(root / folder, create=False)
+        total += len(box)
+        box.close()
+    assert total == 2
+    assert b"<unique@example.com>" in (root / "Inbox").read_bytes()
+    assert (root / "Inbox.msf").read_text() == "mock summary"
+    assert (root / "prefs.js").exists()
+
+
+def test_thunderbird_forced_mbox_format(invoke, tmp_path):
+    """The `mbox` format can be forced on a directory of mbox files."""
+    root = tmp_path / "Local Folders"
+    build_thunderbird_tree(root, {"Inbox": [MailFactory()]})
+
+    result = invoke("--input-format=mbox", "--action=delete-discarded", str(root))
+
+    assert result.exit_code == 0
+    assert "1 mails found." in result.stderr

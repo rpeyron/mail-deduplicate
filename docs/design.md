@@ -16,6 +16,8 @@ For added protection against accidentally removing mails due to false positives,
 
 Mails are loaded from a variety of mailbox formats (`maildir`, `mbox`, `babyl`, `mh`, `mmdf` and `eml`).
 
+A source can also be a directory tree of `mbox` files, which is how Thunderbird stores its folders: every folder is its own extension-less `mbox` file, sub-folders live in `.sbd` directories, and the `.msf` summaries kept next to each folder are ignored.
+
 ## Step 2: Hashing
 
 In theory, we could rely on the mail's `Message-ID` as a key to identify duplicate mails.

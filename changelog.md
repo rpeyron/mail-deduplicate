@@ -5,6 +5,7 @@
 > [!WARNING]
 > This version is **not released yet** and is under active development.
 
+- Accept a directory tree of `mbox` files as a mail source, which is how Thunderbird stores its folders: each `mbox` file opens as its own box, `.sbd` sub-folders are walked, and the `.msf` summaries and other profile files are ignored.
 - Ship the test suite in the PyPI sdist, so downstream packagers can build and test without a Git checkout.
 - Publish a sitemap and a custom 404 page with the documentation, and stop publishing a copy of every documentation source under `_sources/`.
 
