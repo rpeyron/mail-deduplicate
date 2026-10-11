@@ -310,19 +310,31 @@ class DedupMailMixin(Message):
     def parsed_date(self) -> float | None:
         """Parse the mail's date header into float timestamp.
 
-        Returns `None` if the mail has no valid date header.
+        Returns `None` if the mail has no valid date header, or if its date lies
+        outside the range the platform can turn back into a `datetime` (Windows
+        rejects the far past and future that `parsedate_tz` happily converts).
 
         Self-hydrating: re-reads the message from its box if it was dehydrated.
         """
         self.hydrate()
         value = self.get("Date")
+        # A header carrying raw 8-bit bytes comes back as an `email.header.Header`,
+        # which `parsedate_tz` cannot split.
+        if isinstance(value, Header):
+            value = str(value)  # type: ignore[unreachable]
         parsed = email.utils.parsedate_tz(value)
 
         if not parsed:
             logging.debug(f"Mail {self!r} has no valid Date header: {value!r}")
             return None
 
-        return float(email.utils.mktime_tz(parsed))
+        try:
+            timestamp = float(email.utils.mktime_tz(parsed))
+            datetime.fromtimestamp(timestamp, tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            logging.debug(f"Mail {self!r} has an out-of-range Date header: {value!r}")
+            return None
+        return timestamp
 
     @cached_property
     def timestamp(self) -> float | None:
@@ -423,7 +435,11 @@ class DedupMailMixin(Message):
     @cached_property
     def hash_raw_body(self) -> str:
         """Returns the canonical body hash of a mail."""
-        serialized_raw_body = "\n".join(self.body_lines).encode("utf-8")
+        # `surrogateescape` carries through the hash the body bytes no declared
+        # charset could decode, instead of aborting on them.
+        serialized_raw_body = "\n".join(self.body_lines).encode(
+            "utf-8", "surrogateescape"
+        )
         hash_value = hashlib.sha224(serialized_raw_body).hexdigest()
         logging.debug(f"Body raw hash: {hash_value}")
         return hash_value
@@ -433,7 +449,7 @@ class DedupMailMixin(Message):
         """Returns the normalized body hash of a mail."""
         serialized_normalized_body = "".join(
             [re.sub(r"\s", "", line) for line in self.body_lines],
-        ).encode("utf-8")
+        ).encode("utf-8", "surrogateescape")
         hash_value = hashlib.sha224(serialized_normalized_body).hexdigest()
         logging.debug(f"Body normalized hash: {hash_value}")
         return hash_value

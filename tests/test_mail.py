@@ -19,6 +19,7 @@ from __future__ import annotations
 import base64
 import email
 import email.header
+from datetime import datetime, timezone
 from mailbox import Maildir, mbox
 from pathlib import Path
 from typing import Any, cast
@@ -552,6 +553,87 @@ def test_missing_date_header_returns_none():
     """A mail without any `Date` header produces no timestamp instead of crashing."""
     mail = create_mail_with_headers(("Subject", "No date around here"))
     assert mail.parsed_date is None
+
+
+def test_header_object_date_returns_none(tmp_path):
+    """A `Date` handed back as an `email.header.Header` produces no timestamp instead
+    of crashing.
+
+    Headers holding raw 8-bit bytes, which old `mbox` archives like Thunderbird's are
+    full of, come back from the stdlib as `Header` objects rather than strings.
+    """
+    # The same value reaches `parsed_date` through both routes: a `Header` planted on
+    # a parsed message, and an actual 8-bit header round-tripped through an `mbox`.
+    planted = create_mail_with_headers(("Date", email.header.Header("invalid date")))
+    assert planted.parsed_date is None
+
+    box_path = tmp_path / "8bit-date.mbox"
+    box_path.write_bytes(
+        b"From - Sat, 15 Feb 2024 12:00:00 +0100\r\n"
+        b"Date: mer. 15 f\xe9vr. 2024 12:00:00 +0100\r\n"
+        b"From: a@b.c\r\n"
+        b"To: baz\r\n"
+        b"Subject: t\r\n"
+        b"Message-ID: <x@y>\r\n"
+        b"\r\n"
+        b"body\r\n"
+    )
+    box = BoxFormat.MBOX.constructor(box_path, create=False)
+    mail_id, mail = next(iter(box.iteritems()))
+    mail.add_box_metadata(box, mail_id)
+    assert isinstance(mail.get("Date"), email.header.Header)
+    assert mail.parsed_date is None
+    box.close()
+
+
+@pytest.mark.parametrize(
+    "date_value",
+    ("Tue, 1 Jan 1000 00:00:00 +0000", "Fri, 31 Dec 9999 23:59:59 +0000"),
+)
+def test_out_of_range_date_is_rejected_or_renderable(date_value):
+    """A `Date` outside the platform's timestamp range is either dropped or kept as a
+    timestamp that converts back into a `datetime`.
+
+    Windows rejects far past and future dates that `parsedate_tz` happily converts,
+    and `datetime.fromtimestamp` used to abort the whole run on them.
+    """
+    mail = create_mail_with_headers(("Date", date_value))
+    timestamp = mail.parsed_date
+    if timestamp is not None:
+        datetime.fromtimestamp(timestamp, tz=timezone.utc)
+    # Whichever way the date was treated, hashing still normalizes it without raising.
+    assert list(mail.normalized_header_values("date"))
+
+
+def test_undecodable_body_bytes_hash_without_crashing():
+    """Body bytes no charset could decode are hashed instead of aborting the run.
+
+    A multipart's preamble and epilogue reach `body_lines` as strings carrying
+    `surrogateescape` characters, which a plain UTF-8 encoding refuses.
+    """
+    raw_mail = (
+        b"Subject: t\r\n"
+        b"MIME-Version: 1.0\r\n"
+        b"Content-Type: multipart/mixed; boundary=XX\r\n"
+        b"\r\n"
+        b"preamble caf\xe9\r\n"
+        b"--XX\r\n"
+        b"Content-Type: text/plain\r\n"
+        b"\r\n"
+        b"inner\r\n"
+        b"--XX--\r\n"
+        b"epilogue caf\xe9\r\n"
+    )
+    msg = email.message_from_bytes(raw_mail)
+    mail = cast(DedupMailMixin, msg)
+    mail.__class__ = DedupMailMixin
+    mail.box = None
+    mail.source_path = None
+    mail.mail_id = None
+
+    assert any("\udce9" in line for line in mail.body_lines)
+    assert mail.hash_raw_body
+    assert mail.hash_normalized_body
 
 
 def test_maildir_repr_renders_mail_file_path(make_box):
