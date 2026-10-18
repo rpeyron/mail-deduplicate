@@ -61,6 +61,35 @@ if TYPE_CHECKING:
     from click_extra import Context, HelpFormatter, Parameter
 
 
+def _stream_encodes_unicode() -> bool:
+    """Whether the current stdout encoding can represent our Unicode decorations.
+
+    On Windows, when stdout is a pipe or redirected (not a real console handle),
+    Python falls back to the ANSI code page (e.g. cp1252) which cannot encode
+    box-drawing characters or the step bullets. In that case the CLI must fall
+    back to ASCII-safe output instead of crashing with UnicodeEncodeError or
+    writing UTF-8 bytes that a cp1252-reading terminal misinterprets.
+    """
+    import sys
+
+    encoding = getattr(sys.stdout, "encoding", None) or "ascii"
+    try:
+        "●─".encode(encoding)
+    except (UnicodeEncodeError, LookupError):
+        return False
+    return True
+
+
+UNICODE_OK: bool = _stream_encodes_unicode()
+"""True when the CLI can emit Unicode decorations (bullets, box-drawing tables)."""
+
+BULLET: str = "●" if UNICODE_OK else "*"
+"""Step-heading bullet: Unicode when the encoding supports it, ASCII otherwise."""
+
+REPORT_MARK: str = "◼" if UNICODE_OK else "#"
+"""Duplicate-set marker used in debug logs: Unicode or ASCII fallback."""
+
+
 DEFAULT_HASH_HEADERS: tuple[str, ...] = (
     "Date",
     "From",
@@ -875,6 +904,14 @@ def mdedup(
     # A run cut short by an error or an interrupt never reaches `close_all()` below.
     # Unlock its boxes on the way out anyway, or the next run finds them locked.
     ctx.call_on_close(lambda: dedup.close_all(flush=False))
+
+    # Fall back to an ASCII table format when the stream encoding cannot carry
+    # box-drawing characters (legacy Windows code pages on piped/redirected
+    # output). An explicit --table-format still wins.
+    if not UNICODE_OK and ctx.get_parameter_source("table_format") == ParameterSource.DEFAULT:
+        from click_extra import TableFormat, context as click_context
+
+        click_context.set(ctx, click_context.TABLE_FORMAT, TableFormat.GRID)
 
     # The hashing and selection steps set aside the mails an unexpected error hits,
     # and report them at the end. An error escaping the steps ends the run here,

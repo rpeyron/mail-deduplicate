@@ -5,6 +5,8 @@
 > [!WARNING]
 > This version is **not released yet** and is under active development.
 
+- Fall back to ASCII output (step bullets, `grid` table borders) when the stdout encoding cannot carry Unicode, which happens on Windows with legacy ANSI code pages (e.g. cp1252) on piped or redirected output. Fixes a `UnicodeEncodeError` crash on the first step heading.
+
 - Fix the `--strategy` help, which said no action runs without a strategy, while a copy or a move still carries the mails without duplicates.
 - Fix the tutorial and a warning advising to narrow `--hash-header` for mails too dissimilar from their set.
 
