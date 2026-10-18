@@ -120,7 +120,7 @@ class Config(TypedDict):
     show_diff: bool
     strategies: tuple[Strategy, ...]
     time_source: TimeSource
-    regexp: re.Pattern | None
+    regexp: tuple[re.Pattern[str], ...]
     action: Action
     export: Path | None
     export_format: BoxFormat
@@ -166,16 +166,18 @@ def unique_strategies(
     return tuple(deduplicated.values())
 
 
-def compile_regexp(
-    ctx: Context, param: Parameter, value: str
-) -> re.Pattern[str] | None:
-    """Validate and compile regular expression provided as parameters to the CLI."""
-    if value:
+def compile_regexps(
+    ctx: Context, param: Parameter, values: tuple[str, ...]
+) -> tuple[re.Pattern[str], ...]:
+    """Validate and compile the regular expressions provided as parameters to the
+    CLI, preserving their order."""
+    patterns = []
+    for value in values:
         try:
-            return re.compile(value)
+            patterns.append(re.compile(value))
         except re.error:
             raise BadParameter(f"invalid regular expression: {value!r}.")
-    return None
+    return tuple(patterns)
 
 
 PATH_STRATEGIES = (
@@ -428,10 +430,15 @@ def ignored_step_options(ctx) -> list[str]:
     option(
         "-r",
         "--regexp",
-        callback=compile_regexp,
+        multiple=True,
+        callback=compile_regexps,
         metavar="REGEXP",
-        help="Regular expression on a mail's file path. Applies to individual mail "
-        "location for folder-based boxes ("
+        help="Regular expression on a mail's file path. Can be repeated to set an "
+        "ordered cascade, tested in the order provided: the first expression "
+        "splitting a duplicate set into a proper subset wins, so the earliest ones "
+        "have priority, and an expression matching everything or nothing is "
+        "inconclusive and hands the set over to the next one. Applies to individual "
+        "mail location for folder-based boxes ("
         f"{', '.join(map(str, FOLDER_FORMATS))}). But for file-based boxes ("
         f"{', '.join(map(str, FILE_FORMATS))}), applies to the whole box's "
         "path, as all mails are packed into one single file. Required in "

@@ -153,32 +153,51 @@ def select_biggest(duplicates: DuplicateSet) -> set[DedupMailMixin]:
     return {mail for mail in duplicates.pool if mail.size == duplicates.biggest_size}
 
 
+def path_subset(duplicates: DuplicateSet, *, negated: bool) -> set[DedupMailMixin]:
+    """Subset of the set picked by the first `--regexp` expression that discriminates it.
+
+    Expressions are tested in the order they were provided: the first one splitting
+    the set into a non-empty proper subset wins, keeping the matching mails, or their
+    complement when `negated`. An expression matching everything or nothing is
+    inconclusive and hands the set over to the next one. When none discriminates, the
+    first expression's own subset is returned, so the strategy reports the outcome a
+    single expression would have and the cascade moves on to the next strategy.
+    """
+    patterns = duplicates.conf["regexp"]
+    assert patterns
+    pool = set(duplicates.pool)
+    fallback: set[DedupMailMixin] | None = None
+    for pattern in patterns:
+        matching = {mail for mail in pool if re.search(pattern, mail.path)}
+        subset = pool - matching if negated else matching
+        if fallback is None:
+            fallback = subset
+        if len(subset) not in (0, len(pool)):
+            return subset
+    assert fallback is not None
+    return fallback
+
+
 @log_selection(
-    "Select all mails with file path matching the {d.conf[regexp].pattern} regexp..."
+    "Select all mails with file path matching the {d.regexp_cascade} regexps, "
+    "in order..."
 )
 def select_matching_path(duplicates: DuplicateSet) -> set[DedupMailMixin]:
-    """Select all duplicates whose file path match the regular expression provided via
-    the --regexp parameter."""
-    assert duplicates.conf["regexp"] is not None
-    return {
-        mail
-        for mail in duplicates.pool
-        if re.search(duplicates.conf["regexp"], mail.path)
-    }
+    """Select all duplicates whose file path matches one of the regular expressions
+    provided via the --regexp parameter, first expression that discriminates the set
+    winning."""
+    return path_subset(duplicates, negated=False)
 
 
 @log_selection(
-    "Select all mails with file path not matching the {d.conf[regexp].pattern} regexp..."
+    "Select all mails with file path not matching the {d.regexp_cascade} regexps, "
+    "in order..."
 )
 def select_non_matching_path(duplicates: DuplicateSet) -> set[DedupMailMixin]:
-    """Select all duplicates whose file path doesn't match the regular expression
-    provided via the --regexp parameter."""
-    assert duplicates.conf["regexp"] is not None
-    return {
-        mail
-        for mail in duplicates.pool
-        if not re.search(duplicates.conf["regexp"], mail.path)
-    }
+    """Select all duplicates whose file path matches none of the regular expressions
+    provided via the --regexp parameter, first expression that discriminates the set
+    winning."""
+    return path_subset(duplicates, negated=True)
 
 
 @log_selection("Randomly select one duplicate...")

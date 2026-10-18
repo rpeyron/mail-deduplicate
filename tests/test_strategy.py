@@ -681,3 +681,96 @@ def test_content_dissimilar_pair_skipped_without_diff(invoke, make_box):
     assert "too dissimilar in content" in result.stderr
     assert "@@" not in result.stderr  # no unified-diff hunk header without --show-diff
     check_box(box_path, box_type, content=[a, b])
+
+
+def two_folder_corpus(tmp_path, mail):
+    """A maildir tree holding one copy of `mail` in each of the `Keep` and `Drop`
+    folders, and its root path."""
+    root = tmp_path / "corpus"
+    root.mkdir()
+    for folder in ("Keep", "Drop"):
+        box = Maildir(str(root / folder), create=True)
+        box.add(mail.render())
+        box.close()
+    return root
+
+
+def folder_counts(root):
+    """Number of mails left in each folder of a `two_folder_corpus` tree."""
+    counts = {}
+    for folder in ("Keep", "Drop"):
+        box = Maildir(str(root / folder), create=False)
+        counts[folder] = len(box)
+        box.close()
+    return counts
+
+
+def test_regexp_cascade_priority_order(invoke, tmp_path):
+    """The first `--regexp` expression that splits the set wins: `Keep` is tested
+    before `Drop` and both discriminate, so the earliest one has priority."""
+    root = two_folder_corpus(tmp_path, MailFactory())
+
+    result = invoke(
+        "--regexp=Keep",
+        "--regexp=Drop",
+        "--strategy=select-matching-path",
+        "--action=delete-discarded",
+        str(root),
+    )
+
+    assert result.exit_code == 0
+    assert folder_counts(root) == {"Keep": 1, "Drop": 0}
+
+
+def test_regexp_cascade_skips_inconclusive_expression(invoke, tmp_path):
+    """An expression matching nothing is inconclusive and hands the set over to the
+    next one, which then discriminates it."""
+    root = two_folder_corpus(tmp_path, MailFactory())
+
+    result = invoke(
+        "--regexp=Nowhere",
+        "--regexp=Drop",
+        "--strategy=select-matching-path",
+        "--action=delete-discarded",
+        str(root),
+    )
+
+    assert result.exit_code == 0
+    assert folder_counts(root) == {"Keep": 0, "Drop": 1}
+
+
+def test_regexp_cascade_falls_through_to_next_strategy(invoke, tmp_path):
+    """When every expression is inconclusive, the strategy itself fails to
+    discriminate and the strategy cascade takes over."""
+    root = two_folder_corpus(tmp_path, MailFactory())
+
+    result = invoke(
+        "--regexp=.",
+        "--regexp=Nowhere",
+        "--strategy=select-matching-path",
+        "--strategy=select-one",
+        "--action=delete-discarded",
+        str(root),
+    )
+
+    assert result.exit_code == 0
+    assert "Fall back to the next strategy" in result.stderr
+    # select-one keeps a single random copy, whichever folder holds it.
+    assert sum(folder_counts(root).values()) == 1
+
+
+def test_regexp_cascade_non_matching_keeps_complement(invoke, tmp_path):
+    """The `discard-matching-path` alias selects the complement of the first
+    discriminating expression, so the `Keep` copy is the one discarded."""
+    root = two_folder_corpus(tmp_path, MailFactory())
+
+    result = invoke(
+        "--regexp=Keep",
+        "--regexp=Drop",
+        "--strategy=discard-matching-path",
+        "--action=delete-discarded",
+        str(root),
+    )
+
+    assert result.exit_code == 0
+    assert folder_counts(root) == {"Keep": 0, "Drop": 1}

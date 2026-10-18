@@ -5,6 +5,7 @@
 > [!WARNING]
 > This version is **not released yet** and is under active development.
 
+- Accept a repeated `-r`/`--regexp`, tested as an ordered cascade: the first expression splitting a duplicate set wins, so the earliest ones have priority, and an expression matching everything or nothing hands the set over to the next one.
 - Accept a directory tree of `mbox` files as a mail source, which is how Thunderbird stores its folders: each `mbox` file opens as its own box, `.sbd` sub-folders are walked, and the `.msf` summaries and other profile files are ignored.
 - Fix three crashes on real-world mail archives: a `Date` header handed back as an `email.header.Header` instead of a string, a `Date` outside the platform's timestamp range, and body bytes (a multipart's preamble and epilogue among them) that no charset could decode. The first two fall back to an undated mail, the last is hashed through `surrogateescape`.
 - Ship the test suite in the PyPI sdist, so downstream packagers can build and test without a Git checkout.

@@ -202,8 +202,8 @@ def test_export_config_toml_roundtrip(invoke, make_config):
     # and keys use the canonical kebab-case spelling.
     assert "strategies = []" in export
     assert "hash-headers = [" in export
+    assert "regexp = []" in export
     assert "# input-format =" in export
-    assert "# regexp =" in export
     assert "# export =" in export
     # Command-line-only and self-referential parameters are not exported.
     assert "mail_sources" not in export

@@ -265,6 +265,11 @@ class DuplicateSet:
         """Returns the oldest timestamp among all mails in the set."""
         return min(self.timestamps)
 
+    @property
+    def regexp_cascade(self) -> str:
+        """The `--regexp` expressions in the order they are tested, ready to be logged."""
+        return " then ".join(pattern.pattern for pattern in self.conf["regexp"])
+
     @cached_property
     def biggest_size(self) -> int:
         """Returns the biggest size among all mails in the set."""

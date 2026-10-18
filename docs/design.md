@@ -75,6 +75,8 @@ Once all mails have been hashed, mails with the same hash are grouped together a
 
 Several strategies can be chained into a fallback cascade by repeating the `--strategy` option. Each group is submitted to the first strategy, and handed over to the next each time a strategy fails to discriminate its mails: because it selected all of them, none of them, or could not compare mails missing a timestamp. The group is only skipped once the whole cascade is exhausted. A cascade ending with one of the random strategies, which always succeed, resolves the byte-identical copies that time-based and size-based criteria cannot tell apart.
 
+Path-based strategies walk the `--regexp` expressions the same way: repeating `--regexp` builds an ordered cascade, tested in the order provided, and the first expression splitting a group into a proper subset wins, so the earliest expressions have priority. An expression matching everything or nothing is inconclusive and hands the group over to the next expression. Only once they all are does the strategy itself fail to discriminate, and the strategy cascade takes over.
+
 ### ❎ Safeguard: size threshold
 
 Sets of duplicates are verified by comparing the body sizes of the mails they contain, and two mails differing by more than a threshold are not considered copies of each other.
