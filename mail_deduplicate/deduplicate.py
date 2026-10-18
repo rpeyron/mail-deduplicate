@@ -1145,9 +1145,11 @@ class Deduplicate:
         it is actually logged.
         """
         if logging.getLogger().isEnabledFor(logging.DEBUG):
+            from .cli import REPORT_MARK
+
             logging.debug(
                 get_current_theme().subheading(
-                    f"◼ {mail_count} mails sharing hash {hash_key}"
+                    f"{REPORT_MARK} {mail_count} mails sharing hash {hash_key}"
                 )
             )
 

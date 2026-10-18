@@ -59,6 +59,35 @@ if TYPE_CHECKING:
     from click_extra import Context, HelpFormatter, Parameter
 
 
+def _stream_encodes_unicode() -> bool:
+    """Whether the current stdout encoding can represent our Unicode decorations.
+
+    On Windows, when stdout is a pipe or redirected (not a real console handle),
+    Python falls back to the ANSI code page (e.g. cp1252) which cannot encode
+    box-drawing characters or the step bullets. In that case the CLI must fall
+    back to ASCII-safe output instead of crashing with UnicodeEncodeError or
+    writing UTF-8 bytes that a cp1252-reading terminal misinterprets.
+    """
+    import sys
+
+    encoding = getattr(sys.stdout, "encoding", None) or "ascii"
+    try:
+        "●─".encode(encoding)
+    except (UnicodeEncodeError, LookupError):
+        return False
+    return True
+
+
+UNICODE_OK: bool = _stream_encodes_unicode()
+"""True when the CLI can emit Unicode decorations (bullets, box-drawing tables)."""
+
+BULLET: str = "●" if UNICODE_OK else "*"
+"""Step-heading bullet: Unicode when the encoding supports it, ASCII otherwise."""
+
+REPORT_MARK: str = "◼" if UNICODE_OK else "#"
+"""Duplicate-set marker used in debug logs: Unicode or ASCII fallback."""
+
+
 DEFAULT_HASH_HEADERS: tuple[str, ...] = (
     "Date",
     "From",
@@ -650,8 +679,16 @@ def mdedup(
 
     dedup = Deduplicate(conf)
 
+    # Fall back to an ASCII table format when the stream encoding cannot carry
+    # box-drawing characters (legacy Windows code pages on piped/redirected
+    # output). An explicit --table-format still wins.
+    if not UNICODE_OK and ctx.get_parameter_source("table_format") == ParameterSource.DEFAULT:
+        from click_extra import TableFormat, context as click_context
+
+        click_context.set(ctx, click_context.TABLE_FORMAT, TableFormat.GRID)
+
     theme = get_current_theme()
-    echo(theme.heading("\n● Step #1 - Load mails"))
+    echo(theme.heading(f"\n{BULLET} Step #1 - Load mails"))
     with progressbar(
         mail_sources,
         length=len(mail_sources),
@@ -661,7 +698,7 @@ def mdedup(
         for source in progress:
             dedup.add_source(source)
 
-    echo(theme.heading("\n● Step #2 - Compute hashes and group duplicates"))
+    echo(theme.heading(f"\n{BULLET} Step #2 - Compute hashes and group duplicates"))
     dedup.hash_all()
 
     if hash_only:
@@ -684,14 +721,14 @@ def mdedup(
         dedup.close_all()
         ctx.exit()
 
-    echo(theme.heading("\n● Step #3 - Select mails in each group"))
+    echo(theme.heading(f"\n{BULLET} Step #3 - Select mails in each group"))
     dedup.build_sets()
 
-    echo(theme.heading("\n● Step #4 - Perform action on selected mails"))
+    echo(theme.heading(f"\n{BULLET} Step #4 - Perform action on selected mails"))
     action.perform(dedup)
     dedup.close_all()
 
-    echo(theme.heading("\n● Step #5 - Report and statistics"))
+    echo(theme.heading(f"\n{BULLET} Step #5 - Report and statistics"))
     # Print deduplication statistics, then performs a self-check on them.
     echo(dedup.report())
     dedup.check_stats()
